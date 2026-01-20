@@ -1,0 +1,507 @@
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch_geometric.utils import add_remaining_self_loops, degree
+from torch_sparse import SparseTensor, matmul
+
+from backbone import GAT, GATJK, GCN, GCNJK, MLP, MixHop
+from utils import get_ada_edge_index, get_masked_edge_index_str, ub_loss
+
+
+class GraphEncoder(torch.nn.Module):
+    def __init__(self, in_dim, out_dim, args):
+        super().__init__()
+        if args.backbone == "gcn":
+            self.encoder = GCN(
+                in_channels=in_dim,
+                hidden_channels=args.hidden_dim,
+                out_channels=out_dim,
+                num_layers=args.num_layers,
+                dropout=args.dropout,
+                use_bn=args.use_bn,
+            )
+        elif args.backbone == "mlp":
+            self.encoder = MLP(
+                in_channels=in_dim,
+                hidden_channels=args.hidden_dim,
+                out_channels=out_dim,
+                num_layers=args.num_layers,
+                dropout=args.dropout,
+            )
+        elif args.backbone == "gat":
+            self.encoder = GAT(
+                in_dim,
+                args.hidden_dim,
+                out_dim,
+                num_layers=args.num_layers,
+                dropout=args.dropout,
+                use_bn=args.use_bn,
+            )
+        elif args.backbone == "mixhop":
+            self.encoder = MixHop(
+                in_dim,
+                args.hidden_dim,
+                out_dim,
+                num_layers=args.num_layers,
+                dropout=args.dropout,
+            )
+        elif args.backbone == "gcnjk":
+            self.encoder = GCNJK(
+                in_dim,
+                args.hidden_dim,
+                out_dim,
+                num_layers=args.num_layers,
+                dropout=args.dropout,
+            )
+        elif args.backbone == "gatjk":
+            self.encoder = GATJK(
+                in_dim,
+                args.hidden_dim,
+                out_dim,
+                num_layers=args.num_layers,
+                dropout=args.dropout,
+            )
+        else:
+            raise NotImplementedError
+        self.m_criterion = ub_loss()
+
+    def reset_parameters(self):
+        self.encoder.reset_parameters()
+
+    def forward(self, x, edge_index):
+        return self.encoder(x, edge_index)
+
+    def loss_compute(self, dataset_ind, dataset_ood, criterion, device, args, epoch):
+        """return loss for training"""
+        x_in, edge_index_in = dataset_ind.x.to(device), dataset_ind.edge_index.to(
+            device
+        )
+        x_out, edge_index_out = dataset_ood.x.to(device), dataset_ood.edge_index.to(
+            device
+        )
+
+        # get predicted logits from gnn classifier
+        logits_in = self.encoder(x_in, edge_index_in)
+        logits_out = self.encoder(x_out, edge_index_out)
+
+        train_in_idx, train_ood_idx = dataset_ind.splits["train"], dataset_ood.node_idx
+
+        # compute supervised training loss
+        if args.dataset in ("proteins", "ppi"):
+            sup_loss = criterion(
+                logits_in[train_in_idx],
+                dataset_ind.y[train_in_idx].to(device).to(torch.float),
+            )
+        else:
+            pred_in = F.log_softmax(logits_in[train_in_idx], dim=-1)
+            sup_loss = criterion(
+                pred_in, dataset_ind.y[train_in_idx].squeeze(1).to(device)
+            )
+
+        if args.use_reg:  # if use energy regularization
+            if args.dataset in (
+                "proteins",
+                "ppi",
+            ):  # for multi-label binary classification
+                logits_in = torch.stack([logits_in, torch.zeros_like(logits_in)], dim=2)
+                logits_out = torch.stack(
+                    [logits_out, torch.zeros_like(logits_out)], dim=2
+                )
+                energy_in = -args.T * torch.logsumexp(logits_in / args.T, dim=-1).sum(
+                    dim=1
+                )
+                energy_out = -args.T * torch.logsumexp(logits_out / args.T, dim=-1).sum(
+                    dim=1
+                )
+            else:  # for single-label multi-class classification
+                energy_in = -args.T * torch.logsumexp(logits_in / args.T, dim=-1)
+                energy_out = -args.T * torch.logsumexp(logits_out / args.T, dim=-1)
+
+            if args.use_prop:  # use energy belief propagation
+                energy_in = self.propagation(
+                    energy_in, edge_index_in, args.K, args.alpha
+                )[train_in_idx]
+                energy_out = self.propagation(
+                    energy_out, edge_index_out, args.K, args.alpha
+                )[train_ood_idx]
+            else:
+                energy_in = energy_in[train_in_idx]
+                energy_out = energy_out[train_in_idx]
+
+            # truncate to have the same length
+            if energy_in.shape[0] != energy_out.shape[0]:
+                min_n = min(energy_in.shape[0], energy_out.shape[0])
+                energy_in = energy_in[:min_n]
+                energy_out = energy_out[:min_n]
+
+            # compute regularization loss
+            reg_loss = torch.mean(
+                F.relu(energy_in - args.m_in) ** 2
+                + F.relu(args.m_out - energy_out) ** 2
+            )
+
+            loss = sup_loss + args.lamda * reg_loss
+        else:
+            loss = sup_loss
+
+        if args.use_UB:
+            mloss_in, _ = self.m_criterion(
+                _features=logits_in[train_in_idx],
+                labels=dataset_ind.y[train_in_idx].squeeze(1).to(device),
+                epoch=epoch,
+            )
+            loss = loss + 1 * mloss_in
+
+        return loss
+
+
+class GraphSafe(object):
+    def __init__(self, encoder):
+        self.encoder = encoder
+        self.encoder.eval()
+
+    def get_energy(self, dataset, device, args):
+        """return negative energy, a vector for all input nodes"""
+        x, edge_index = dataset.x.to(device), dataset.edge_index.to(device)
+        logits = self.encoder(x, edge_index)
+        if args.dataset in ("proteins", "ppi"):  # for multi-label binary classification
+            logits = torch.stack([logits, torch.zeros_like(logits)], dim=2)
+            neg_energy = args.T * torch.logsumexp(logits / args.T, dim=-1).sum(dim=1)
+        else:  # for single-label multi-class classification
+            neg_energy = args.T * torch.logsumexp(logits / args.T, dim=-1)
+        return neg_energy, logits
+
+    def propagation(self, e, edge_index, prop_layers=1, alpha=0.5):
+        """energy belief propagation, return the energy after propagation"""
+        e = e.unsqueeze(1)
+        N = e.shape[0]
+        row, col = edge_index
+        d = degree(col, N).float()
+        d_norm = 1.0 / d[col]
+        value = torch.ones_like(row) * d_norm
+        value = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
+        adj = SparseTensor(row=col, col=row, value=value, sparse_sizes=(N, N))
+        adj = adj.cpu()
+        # print(e.shape)
+        for _ in range(prop_layers):
+            e = e * alpha + matmul(adj, e) * (1 - alpha)
+        return e.squeeze(1)
+
+    def detect(self, dataset_ind, dataset_ood, device, args):
+        ind_e, _ = self.get_energy(dataset_ind, device, args)
+        ind_e = ind_e.cpu()
+        test_ood_e, _ = self.get_energy(dataset_ood, device, args)
+        test_ood_e = test_ood_e.cpu()
+
+        if args.use_prop:
+            ind_e = self.propagation(ind_e, dataset_ind.edge_index, args.K, args.alpha)
+            test_ood_e = self.propagation(
+                test_ood_e, dataset_ood.edge_index, args.K, args.alpha
+            )
+        return (
+            ind_e[dataset_ind.splits["test"]],
+            test_ood_e[dataset_ood.node_idx],
+        )
+
+
+class StructureEnergy(object):
+    def __init__(self, encoder):
+        self.encoder = encoder
+        self.encoder.eval()
+
+    def get_energy(self, dataset, device, args):
+        """return negative energy, a vector for all input nodes"""
+        x, edge_index = dataset.x.to(device), dataset.edge_index.to(device)
+        logits = self.encoder(x, edge_index)
+        if args.dataset in ("proteins", "ppi"):  # for multi-label binary classification
+            logits = torch.stack([logits, torch.zeros_like(logits)], dim=2)
+            neg_energy = args.T * torch.logsumexp(logits / args.T, dim=-1).sum(dim=1)
+        else:  # for single-label multi-class classification
+            neg_energy = args.T * torch.logsumexp(logits / args.T, dim=-1)
+        return neg_energy, logits
+
+    def propagation(self, e, edge_index, prop_layers=1, alpha=0.5):
+        """energy belief propagation, return the energy after propagation"""
+        e = e.unsqueeze(1).cpu()
+        N = e.shape[0]
+        row, col = edge_index
+        d = degree(col, N).float()
+        d_norm = 1.0 / d[col]
+        value = torch.ones_like(row) * d_norm
+        value = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
+        adj = SparseTensor(row=col, col=row, value=value, sparse_sizes=(N, N))
+        adj = adj.cpu()
+        for _ in range(prop_layers):
+            e = e * alpha + matmul(adj, e) * (1 - alpha)
+        return e.squeeze(1)
+
+    def run_structural_energy(
+        self,
+        ind_e,
+        test_ind_e,
+        test_ood_e,
+        dataset_ind,
+        dataset_ood,
+        args,
+        device,
+        threshold=False,
+    ):
+        if threshold:
+            threshold_ind, threshold_ood = threshold[0], threshold[1]
+        else:
+            # 确定阈值
+            test_node_e = torch.cat(
+                [test_ind_e[dataset_ind.splits["test"]], test_ood_e], dim=0
+            )
+            threshold_ind = np.percentile(test_node_e, 95)
+            threshold_ood = np.percentile(test_node_e, 5)
+
+        # for test_ind
+        ind_mask_for_test_ind = test_ind_e >= threshold_ind
+        ood_mask_for_test_ind = test_ind_e <= threshold_ood
+        uncertain_mask_for_test_ind = (test_ind_e < threshold_ind) & (
+            test_ind_e > threshold_ood
+        )
+
+        revised_edge_index_for_ind = get_masked_edge_index_str(
+            dataset_ind,
+            knn_k=args.knn_k,
+            uncertain_mask=uncertain_mask_for_test_ind.cpu(),
+            ind_mask=ind_mask_for_test_ind.cpu(),
+            ood_mask=ood_mask_for_test_ind.cpu(),
+            args=args,
+        )
+        revised_edge_index_for_ind, _ = add_remaining_self_loops(
+            revised_edge_index_for_ind
+        )
+
+        if args.use_prop:
+            ind_e = self.propagation(
+                ind_e, revised_edge_index_for_ind, device, args.K, args.alpha
+            )
+
+        # for test_ood
+        ind_mask_for_test_ood = test_ood_e >= threshold_ind
+        ood_mask_for_test_ood = test_ood_e <= threshold_ood
+        uncertain_mask_for_test_ood = (test_ood_e < threshold_ind) & (
+            test_ood_e > threshold_ood
+        )
+        # np.savetxt("ind_mask_for_test_ood.txt", ind_mask_for_test_ood.numpy(), fmt="%d")
+
+        revised_edge_index_for_ood = get_masked_edge_index_str(
+            dataset_ood,
+            knn_k=args.knn_k,
+            uncertain_mask=uncertain_mask_for_test_ood,
+            ind_mask=ind_mask_for_test_ood,
+            ood_mask=ood_mask_for_test_ood,
+            args=args,
+        )
+        revised_edge_index_for_ood, _ = add_remaining_self_loops(
+            revised_edge_index_for_ood
+        )
+
+        if args.use_prop:
+            test_ood_e = self.propagation(
+                test_ood_e.squeeze(),
+                revised_edge_index_for_ood,
+                device,
+                args.K,
+                args.alpha,
+            )
+        return ind_e, test_ood_e
+
+    def structure_energy_detect(self, dataset_ind, dataset_ood, device, args):
+        ind_e, ind_h = self.get_energy(dataset_ind, device, args)
+        ind_h = ind_h.cpu()
+        # train_e = ind_e[dataset_ind.splits["train"]].unsqueeze(1).cpu()
+        test_ind_e = ind_e.unsqueeze(1).cpu()
+
+        test_ood_e, test_ood_h = self.get_energy(dataset_ood, device, args)
+        test_ood_h = test_ood_h.cpu()
+        test_ood_e = test_ood_e.unsqueeze(1).cpu()
+
+        # threshold_ind = np.percentile(train_e, 90)
+        # threshold_ood = np.percentile(train_e, 10)
+
+        for _ in range(args.prop_layer):
+            ind_e, test_ood_e = self.run_structural_energy(
+                ind_e,
+                test_ind_e,
+                test_ood_e,
+                dataset_ind,
+                dataset_ood,
+                args,
+                device,
+                # [threshold_ind, threshold_ood],
+            )
+            test_ind_e = ind_e.unsqueeze(1).cpu()
+            test_ood_e = test_ood_e.unsqueeze(1).cpu()
+
+        test_ood_e = test_ood_e.squeeze()
+        return (
+            ind_e[dataset_ind.splits["test"]],
+            test_ood_e[dataset_ood.node_idx],
+        )
+
+    def detect(self, dataset_ind, dataset_ood, device, args):
+        test_ind_e, test_ood_e = self.structure_energy_detect(
+            dataset_ind, dataset_ood, device, args
+        )
+        # np.savetxt("test_ind_origin_e.txt", test_ind_origin_e.numpy(), fmt="%.4f")
+        # np.savetxt("test_ood_origin_e.txt", test_ood_origin_e.numpy(), fmt="%.4f")
+        return test_ind_e, test_ood_e
+
+
+class DualChanEnergy(object):
+    def __init__(self, encoder):
+        self.encoder = encoder
+        self.encoder.eval()
+
+    def get_energy(self, dataset, device, args):
+        """return negative energy, a vector for all input nodes"""
+        x, edge_index = dataset.x.to(device), dataset.edge_index.to(device)
+        logits = self.encoder(x, edge_index)
+        if args.dataset in ("proteins", "ppi"):  # for multi-label binary classification
+            logits = torch.stack([logits, torch.zeros_like(logits)], dim=2)
+            neg_energy = args.T * torch.logsumexp(logits / args.T, dim=-1).sum(dim=1)
+        else:  # for single-label multi-class classification
+            neg_energy = args.T * torch.logsumexp(logits / args.T, dim=-1)
+        return neg_energy, logits
+
+    def propagation(self, e, edge_index, edge_value=None, prop_layers=1, alpha=0.5):
+        """energy belief propagation, return the energy after propagation"""
+        N = e.shape[0]
+        # edge_index, edge_value = add_remaining_self_loops(edge_index, edge_value)
+        row, col = edge_index
+        d = degree(col, N).float()
+        # d_norm = 1.0 / np.sqrt(d[col] * d[row])
+        d_norm = 1.0 / d[col]
+        if edge_value is None:
+            value = torch.ones_like(row)
+        else:
+            value = edge_value
+        value *= d_norm
+        value = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
+        adj = SparseTensor(row=col, col=row, value=value, sparse_sizes=(N, N))
+        adj = adj.cpu()
+        for _ in range(1):
+            e = e * alpha + matmul(adj, e) * (1 - alpha)
+            # e = matmul(adj, e)
+        return e.squeeze(1)
+
+    def safe_detect(self, dataset_ind, dataset_ood, device, args):
+        ind_e, _ = self.get_energy(dataset_ind, device, args)
+        ind_e = ind_e.cpu()
+        test_ood_e, _ = self.get_energy(dataset_ood, device, args)
+        test_ood_e = test_ood_e.cpu()
+
+        if args.use_prop:
+            ind_e = self.propagation(ind_e, dataset_ind.edge_index, args.K, args.alpha)
+            test_ood_e = self.propagation(
+                test_ood_e, dataset_ood.edge_index, args.K, args.alpha
+            )
+
+        return (
+            ind_e[dataset_ind.splits["test"]],
+            test_ood_e[dataset_ood.node_idx],
+        )
+
+    def run_ada_energy(
+        self,
+        test_ind_e,
+        test_ood_e,
+        dataset_ind,
+        dataset_ood,
+        args,
+        threshold=None,
+    ):
+        if threshold is not None:
+            threshold_ind, threshold_ood = threshold[0], threshold[1]
+        else:
+            # 确定阈值
+            test_node_e = torch.cat(
+                [test_ind_e[dataset_ind.splits["test"]], test_ood_e], dim=0
+            )
+            threshold_ind = np.percentile(test_node_e, 95)
+            threshold_ood = np.percentile(test_node_e, 5)
+
+        # for test_ind
+        ind_mask_for_test_ind = test_ind_e >= threshold_ind
+        ood_mask_for_test_ind = test_ind_e <= threshold_ood
+        uncertain_mask_for_test_ind = (test_ind_e < threshold_ind) & (
+            test_ind_e > threshold_ood
+        )
+        # get edge_index value for ind data
+        edge_value_for_ind = get_ada_edge_index(
+            data=dataset_ind,
+            uncertain_mask=uncertain_mask_for_test_ind,
+            ind_mask=ind_mask_for_test_ind,
+            ood_mask=ood_mask_for_test_ind,
+        )
+        # print(edge_value_for_ind.shape)
+
+        # for test_ood
+        ind_mask_for_test_ood = test_ood_e >= threshold_ind
+        ood_mask_for_test_ood = test_ood_e <= threshold_ood
+        uncertain_mask_for_test_ood = (test_ood_e < threshold_ind) & (
+            test_ood_e > threshold_ood
+        )
+        # get edge_index value for ood data
+        edge_value_for_ood = get_ada_edge_index(
+            data=dataset_ood,
+            uncertain_mask=uncertain_mask_for_test_ood,
+            ind_mask=ind_mask_for_test_ood,
+            ood_mask=ood_mask_for_test_ood,
+        )
+
+        if args.use_prop:
+            ind_e = self.propagation(
+                e=test_ind_e,
+                edge_index=dataset_ind.edge_index,
+                edge_value=edge_value_for_ind,
+                prop_layers=args.K,
+                alpha=args.alpha,
+            )
+            test_ood_e = self.propagation(
+                e=test_ood_e,
+                edge_index=dataset_ood.edge_index,
+                edge_value=edge_value_for_ood,
+                prop_layers=args.K,
+                alpha=args.alpha,
+            )
+        return ind_e, test_ood_e
+
+    def detect(
+        self,
+        dataset_ind,
+        dataset_ood,
+        device,
+        args,
+        threshold=None,
+    ):
+        ind_e, _ = self.get_energy(dataset_ind, device, args)
+        test_ind_e = ind_e.unsqueeze(1).cpu()
+
+        test_ood_e, _ = self.get_energy(dataset_ood, device, args)
+        test_ood_e = test_ood_e.unsqueeze(1).cpu()
+
+        dataset_ind = dataset_ind.cpu()
+        dataset_ood = dataset_ood.cpu()
+
+        for _ in range(args.K):
+            ind_e, test_ood_e = self.run_ada_energy(
+                test_ind_e=test_ind_e,
+                test_ood_e=test_ood_e,
+                dataset_ind=dataset_ind,
+                dataset_ood=dataset_ood,
+                args=args,
+                threshold=threshold,
+            )
+            test_ind_e = ind_e.unsqueeze(1).cpu()
+            test_ood_e = test_ood_e.unsqueeze(1).cpu()
+
+        test_ood_e = test_ood_e.squeeze()
+        return (
+            ind_e[dataset_ind.splits["test"]],
+            test_ood_e[dataset_ood.node_idx],
+        )
